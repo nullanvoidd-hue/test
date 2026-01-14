@@ -1,0 +1,7 @@
+{
+    "author" : ["Author"],
+    "install_msg" : "lol",
+    "name" : "randomtag",
+    "short" : "does a tag randomly",
+    "description" : "pulls a tag randomly. [p]randomtag"
+}
