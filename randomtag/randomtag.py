@@ -2,20 +2,22 @@ import random
 import discord
 import logging
 from datetime import datetime, timedelta
+
 from redbot.core import commands, Config
 from discord.ext import tasks
 
 log = logging.getLogger("red.seina.randomtag")
 
+
 class RandomTag(commands.Cog):
-    """Automated random tag posting compatible with Seina-Cogs."""
+    """Automated random tag posting compatible with Seina-Cogs Tags."""
 
     def __init__(self, bot):
         self.bot = bot
-        self.config = Config.get_conf(self, identifier=998877665544)
+        self.config = Config.get_conf(self, identifier=998877665544, force_registration=True)
         default_guild = {
             "channel_id": None,
-            "last_post": 0  # Stores timestamp of last post
+            "last_post": 0.0,  # Unix timestamp of last post
         }
         self.config.register_guild(**default_guild)
         self.daily_loop.start()
@@ -23,42 +25,52 @@ class RandomTag(commands.Cog):
     def cog_unload(self):
         self.daily_loop.cancel()
 
-    @tasks.loop(minutes=30)  # Check every 30 mins to see if 24h have passed
+    @tasks.loop(minutes=30)
     async def daily_loop(self):
+        """Check every 30 minutes and post a tag if 24h passed."""
         tags_cog = self.bot.get_cog("Tags")
         if not tags_cog:
             return
 
+        # Prefer aware datetimes using Discord's epoch
+        now = datetime.utcnow()
+
         for guild in self.bot.guilds:
             conf = await self.config.guild(guild).all()
-            if not conf["channel_id"]:
+            channel_id = conf.get("channel_id")
+            last_post_ts = conf.get("last_post", 0.0)
+
+            if not channel_id:
                 continue
 
-            # Check if 24 hours have passed since last_post
-            last_post_time = datetime.fromtimestamp(conf["last_post"])
-            if datetime.now() < last_post_time + timedelta(hours=24):
+            # Check 24h cooldown
+            if last_post_ts:
+                last_post_time = datetime.utcfromtimestamp(last_post_ts)
+                if now < last_post_time + timedelta(hours=24):
+                    continue
+
+            channel = guild.get_channel(channel_id)
+            if not isinstance(channel, discord.TextChannel):
                 continue
 
-            channel = guild.get_channel(conf["channel_id"])
-            if not channel:
-                continue
+            # Seina Tags uses in-memory caches like guild_tag_cache and global_tag_cache
+            guild_cache = getattr(tags_cog, "guild_tag_cache", {}).get(guild.id, {})
+            global_cache = getattr(tags_cog, "global_tag_cache", {})
 
-            # Compatibility: Pull from Seina's internal defaultdict caches
-            guild_cache = tags_cog.guild_tag_cache.get(guild.id, {})
-            global_cache = tags_cog.global_tag_cache
-            
-            # Combine all available Tag objects
+            # Tag objects (keys are names, values are Tag objects)
             all_tags = list(guild_cache.values()) + list(global_cache.values())
+            if not all_tags:
+                continue
 
-            if all_tags:
-                tag_to_send = random.choice(all_tags)
-                try:
-                    # Using Seina's Processor mixin method
-                    # author=guild.me ensures TagScript variables like {author} don't break
-                    await tags_cog.process_tag(channel, tag_to_send, author=guild.me)
-                    await self.config.guild(guild).last_post.set(datetime.now().timestamp())
-                except Exception as e:
-                    log.error(f"Error auto-posting tag in {guild.id}: {e}")
+            tag_to_send = random.choice(all_tags)
+
+            try:
+                # Seina’s Tags exposes process_tag(ctx_or_channel, tag, **kwargs)
+                # Using author=guild.me so tags referring to {author} work
+                await tags_cog.process_tag(channel, tag_to_send, author=guild.me)
+                await self.config.guild(guild).last_post.set(now.timestamp())
+            except Exception as e:
+                log.error("Error auto-posting tag in %s: %r", guild.id, e)
 
     @daily_loop.before_loop
     async def before_daily_loop(self):
@@ -66,12 +78,33 @@ class RandomTag(commands.Cog):
 
     @commands.group()
     @commands.admin_or_permissions(manage_guild=True)
-    async def tagschedule(self, ctx):
+    @commands.guild_only()
+    async def tagschedule(self, ctx: commands.Context):
         """Manage 24-hour random tag posting."""
-        pass
+        if ctx.invoked_subcommand is None:
+            conf = await self.config.guild(ctx.guild).all()
+            channel_id = conf.get("channel_id")
+            last_post_ts = conf.get("last_post", 0.0)
+
+            channel_display = "Disabled"
+            if channel_id:
+                channel = ctx.guild.get_channel(channel_id)
+                if channel:
+                    channel_display = f"{channel.mention} (ID: {channel.id})"
+
+            last_post_display = "Never"
+            if last_post_ts:
+                dt = datetime.utcfromtimestamp(last_post_ts)
+                last_post_display = f"{discord.utils.format_dt(dt, style='R')}"
+
+            await ctx.send(
+                f"Current daily tag channel: {channel_display}\n"
+                f"Last automatic post: {last_post_display}"
+            )
 
     @tagschedule.command(name="channel")
-    async def set_channel(self, ctx, channel: discord.TextChannel = None):
+    @commands.guild_only()
+    async def tagschedule_channel(self, ctx: commands.Context, channel: discord.TextChannel = None):
         """Set the channel for daily tags. Leave empty to disable."""
         if channel:
             await self.config.guild(ctx.guild).channel_id.set(channel.id)
@@ -82,19 +115,24 @@ class RandomTag(commands.Cog):
 
     @commands.command()
     @commands.guild_only()
-    async def tagrandom(self, ctx):
-        """Manually trigger a random tag."""
+    async def tagrandom(self, ctx: commands.Context):
+        """Manually trigger a random tag using Seina Tags."""
         tags_cog = self.bot.get_cog("Tags")
         if not tags_cog:
-            return await ctx.send("The Tags cog is not loaded.")
+            await ctx.send("The Tags cog is not loaded.")
+            return
 
-        guild_cache = tags_cog.guild_tag_cache.get(ctx.guild.id, {})
-        all_tags = list(guild_cache.values()) + list(tags_cog.global_tag_cache.values())
-        
+        guild_cache = getattr(tags_cog, "guild_tag_cache", {}).get(ctx.guild.id, {})
+        global_cache = getattr(tags_cog, "global_tag_cache", {})
+
+        all_tags = list(guild_cache.values()) + list(global_cache.values())
         if not all_tags:
-            return await ctx.send("No tags found for this server or globally.")
-        
-        await tags_cog.process_tag(ctx, random.choice(all_tags))
+            await ctx.send("No tags found for this server or globally.")
+            return
+
+        tag_to_send = random.choice(all_tags)
+        # Use ctx as first argument to match Seina’s process_tag signature
+        await tags_cog.process_tag(ctx, tag_to_send)
 
 async def setup(bot):
     await bot.add_cog(RandomTag(bot))
